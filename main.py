@@ -34,6 +34,11 @@ async def test_prefix(ctx: commands.context):
     await ctx.send("sam jestes cwel")
 
 
+@bot.tree.command(name="help", description="Rozpiska komend bota")
+async def test_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("chuj ci w dupe")
+
+
 STARBASE_URL = "https://www.starbase.texas.gov/beach-road-access"
 
 
