@@ -29,6 +29,11 @@ async def test_prefix(ctx: commands.Context):
 async def cwel_command(ctx: commands.Context):
     await ctx.send("sam jestes cwel")
 
+@bot.tree.command(name="help", description="Rozpiska komend bota")
+async def help_slash(interaction: discord.Interaction):
+    await interaction.response.send_message("chuj ci w dupe")
+
+
 STARBASE_URL = "https://www.starbase.texas.gov/beach-road-access"
 
 def fetch_starbase_status() -> tuple[str, str]:
