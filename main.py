@@ -30,8 +30,12 @@ async def cwel_command(ctx: commands.Context):
     await ctx.send("sam jestes cwel")
 
 @bot.tree.command(name="help", description="Rozpiska komend bota")
-async def help_slash(interaction: discord.Interaction):
-    await interaction.response.send_message("chuj ci w dupe")
+async def bulid_help_embed(interaction: discord.Interaction):
+    embed = discord.Embed(title="Tile", description="Desc", color=0x00ff00)
+    embed.add_field(name="Fiel1", value="hi", inline=False)
+    embed.add_field(name="Field2", value="hi2", inline=False)
+    await interaction.response.send_message(embed=embed)
+
 
 
 STARBASE_URL = "https://www.starbase.texas.gov/beach-road-access"
