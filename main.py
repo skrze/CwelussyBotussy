@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 
 import discord
 import requests
@@ -47,13 +48,12 @@ def fetch_starbase_status() -> tuple[str, str]:
         beach_container.find("div", class_="cms-big-text").get_text(strip=True)
         if beach_container
         else "Brak danych o statusie plaży."
+    
     )
 
     road_container = soup.find(id="road-closure")
     road_text = "Brak danych o drodze."
     if road_container:
-        # Webflow hides the inactive state with the "w-condition-invisible" class,
-        # so only the div(s) without that class reflect the current status.
         visible = [
             el.get_text(strip=True)
             for el in road_container.find_all("div", class_="cms-big-text")
@@ -61,7 +61,6 @@ def fetch_starbase_status() -> tuple[str, str]:
         ]
         if visible:
             road_text = " ".join(visible)
-
     return beach_text, road_text
 
 
@@ -90,6 +89,7 @@ async def zamkniecia_slash(interaction: discord.Interaction):
         embed = await build_starbase_embed()
         await interaction.followup.send(embed=embed)
     except Exception:
+        traceback.print_exc()
         await interaction.followup.send("Nie udało się pobrać danych ze strony starbase.texas.gov.")
 
 
@@ -100,6 +100,7 @@ async def zamkniecia_prefix(ctx: commands.Context):
             embed = await build_starbase_embed()
             await ctx.send(embed=embed)
         except Exception:
+            traceback.print_exc()
             await ctx.send("Nie udało się pobrać danych ze strony starbase.texas.gov.")
 
 
