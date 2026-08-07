@@ -31,8 +31,8 @@ async def cwel_command(ctx: commands.Context):
 
 @bot.tree.command(name="help", description="Rozpiska komend bota")
 async def bulid_help_embed(interaction: discord.Interaction):
-    embed = discord.Embed(title="Tile", description="Desc", color=0x00ff00)
-    embed.add_field(name="Fiel1", value="hi", inline=False)
+    embed = discord.Embed(title="Lista komend:", description="jestem cwelem", color=0x00ff00)
+    embed.add_field(name="Zamkniecia", value="Wyswietla dane na temat zamkniec w box chix ", inline=False)
     embed.add_field(name="Field2", value="hi2", inline=False)
     await interaction.response.send_message(embed=embed)
 
