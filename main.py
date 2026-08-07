@@ -42,7 +42,7 @@ async def bulid_help_embed(interaction: discord.Interaction):
         value=f"Bot sam sprawdza co {TFR_CHECK_INTERVAL_MINUTES} min i wysyla nowe TFR na <#{NOTIFY_CHANNEL_ID}>",
         inline=False,
     )
-    embed.add_field(name="Spacenotices", value="Notki i zdjecia TFR tylko ze space-notices.com", inline=False)
+    embed.add_field(name="Spacenotices", value="Lista aktywnych startow do wyboru - notki i zdjecia po wybraniu", inline=False)
     await interaction.response.send_message(embed=embed)
 
 
@@ -174,11 +174,11 @@ def _consume_new_tfr_ids(tfrs: list[dict]) -> tuple[set[str], set[str]]:
     save_seen_tfr_ids(current_ids)
     return current_ids, new_ids
 
-SPACE_NOTICES_ENTRY_URL = "https://space-notices.com/entry/collection-starbase-testing"
 SPACE_NOTICES_HOME_URL = "https://space-notices.com/"
 SPACE_NOTICES_IMAGE_URL = "https://space-notices.com/og/entry/{slug}/{index}"
 SPACE_NOTICES_MAX_IMAGES = 9  # Discord caps a message at 10 embeds; 1 is reserved for the text embed
 SPACE_NOTICES_ENTRY_LINK = "https://space-notices.com/entry/{slug}"
+STARBASE_TESTING_COLLECTION_SLUG = "collection-starbase-testing"
 
 def _extract_rsc_json(html: str, key: str):
     """Next.js streams page data as escaped JSON inside self.__next_f.push(...) chunks.
@@ -220,9 +220,9 @@ def _extract_rsc_json(html: str, key: str):
         i += 1
     return json.loads(payload[start:i])
 
-def fetch_space_notices_tfrs() -> list[dict]:
+def fetch_entry_notices(slug: str) -> list[dict]:
     resp = requests.get(
-        SPACE_NOTICES_ENTRY_URL,
+        SPACE_NOTICES_ENTRY_LINK.format(slug=slug),
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=15
     )
@@ -233,23 +233,40 @@ def fetch_space_notices_tfrs() -> list[dict]:
         notices.extend(group.get("notices", []))
     return notices
 
-def fetch_starbase_tfr_images() -> list[tuple[bytes, str, str, int]]:
-    """space-notices.com only renders real hazard-map images for an active
-    Starship launch entry (not for the static-fire/WDR testing notices), and
-    each leg of the trajectory (e.g. Gulf/Caribbean ascent, Indian Ocean
-    re-entry) gets its own image at /og/entry/<slug>/<index>. This probes
-    sequential indices until the server 404s and returns all of them."""
+def fetch_active_entry_slugs() -> list[str]:
+    """Every entry currently listed on the space-notices.com homepage
+    (collections and individual launches, active right now)."""
     resp = requests.get(
         SPACE_NOTICES_HOME_URL,
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=15
     )
     resp.raise_for_status()
-    match = re.search(r'"(launch-starship-flight-\d+)"', resp.text)
-    if not match:
-        return []
-    slug = match.group(1)
+    slugs, seen = [], set()
+    for slug in re.findall(r'"/entry/([a-z0-9][a-z0-9-]*)"', resp.text):
+        if slug not in seen:
+            seen.add(slug)
+            slugs.append(slug)
+    return slugs
 
+_ENTRY_SLUG_PREFIXES = ("launch-", "collection-", "other-")
+
+def _prettify_slug(slug: str) -> str:
+    name = slug
+    for prefix in _ENTRY_SLUG_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    return name.replace("-", " ").title()
+
+def fetch_active_entries() -> list[tuple[str, str]]:
+    """Returns (slug, display_name) pairs for the dropdown menu."""
+    return [(slug, _prettify_slug(slug)) for slug in fetch_active_entry_slugs()]
+
+def _fetch_entry_images(slug: str) -> list[tuple[bytes, str, str, int]]:
+    """Each leg of an entry's trajectory (e.g. Gulf/Caribbean ascent, Indian
+    Ocean re-entry) gets its own hazard-map image at /og/entry/<slug>/<index>.
+    Probes sequential indices until the server 404s."""
     images = []
     for index in range(SPACE_NOTICES_MAX_IMAGES):
         img_resp = requests.get(
@@ -263,11 +280,26 @@ def fetch_starbase_tfr_images() -> list[tuple[bytes, str, str, int]]:
         images.append((img_resp.content, f"tfr_{slug}_{index}.{ext}", slug, index))
     return images
 
-def _format_space_notice_lines(notices: list[dict]) -> str:
-    return "\n".join(
-        f"{'~~' if n.get('cancelled') else ''}{n.get('name', n.get('id', '?'))}{'~~' if n.get('cancelled') else ''}"
-        for n in notices
+def fetch_starbase_launch_images() -> list[tuple[bytes, str, str, int]]:
+    """space-notices.com only renders real hazard-map images for an active
+    Starship launch entry (not for the static-fire/WDR testing notices)."""
+    resp = requests.get(
+        SPACE_NOTICES_HOME_URL,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=15
     )
+    resp.raise_for_status()
+    match = re.search(r'"(launch-starship-flight-\d+)"', resp.text)
+    if not match:
+        return []
+    return _fetch_entry_images(match.group(1))
+
+def _format_space_notice_lines(notices: list[dict]) -> str:
+    lines = []
+    for n in notices:
+        label = f"`{n.get('type', '?')}` {n.get('name', n.get('id', '?'))}"
+        lines.append(f"~~{label}~~" if n.get("cancelled") else label)
+    return "\n".join(lines)
 
 def _build_image_embeds(
     images: list[tuple[bytes, str, str, int]], link_url: str
@@ -308,7 +340,7 @@ async def _build_tfr_content(tfrs: list[dict], new_ids: set[str]) -> tuple[list[
         )
 
     try:
-        space_notices = await asyncio.to_thread(fetch_space_notices_tfrs)
+        space_notices = await asyncio.to_thread(fetch_entry_notices, STARBASE_TESTING_COLLECTION_SLUG)
     except Exception:
         traceback.print_exc()
         space_notices = []
@@ -322,7 +354,7 @@ async def _build_tfr_content(tfrs: list[dict], new_ids: set[str]) -> tuple[list[
     embeds = [embed]
     files = []
     try:
-        images = await asyncio.to_thread(fetch_starbase_tfr_images)
+        images = await asyncio.to_thread(fetch_starbase_launch_images)
     except Exception:
         traceback.print_exc()
         images = []
@@ -380,70 +412,101 @@ async def watch_for_new_tfrs():
 async def before_watch_for_new_tfrs():
     await bot.wait_until_ready()
 
-async def build_space_notices_embed() -> tuple[list[discord.Embed], list[discord.File]]:
+async def build_entry_embed(slug: str) -> tuple[list[discord.Embed], list[discord.File]]:
     try:
-        notices = await asyncio.to_thread(fetch_space_notices_tfrs)
+        notices = await asyncio.to_thread(fetch_entry_notices, slug)
     except Exception:
         traceback.print_exc()
         notices = []
+    try:
+        images = await asyncio.to_thread(_fetch_entry_images, slug)
+    except Exception:
+        traceback.print_exc()
+        images = []
 
     embed = discord.Embed(
-        title="Space Notices — Starbase",
-        url=SPACE_NOTICES_ENTRY_URL,
+        title=_prettify_slug(slug),
+        url=SPACE_NOTICES_ENTRY_LINK.format(slug=slug),
         color=discord.Color.blurple(),
     )
     embed.description = (
         _format_space_notice_lines(notices) if notices
-        else "Brak danych o notkach ze space-notices.com."
+        else "Brak notek dla tego wpisu."
     )
 
     embeds = [embed]
     files = []
-    try:
-        images = await asyncio.to_thread(fetch_starbase_tfr_images)
-    except Exception:
-        traceback.print_exc()
-        images = []
     if images:
-        slug = images[0][2]
-        embed.add_field(
-            name="🗺️ Aktywny start",
-            value=f"[{slug}]({SPACE_NOTICES_ENTRY_LINK.format(slug=slug)}) — {len(images)} zdjęcie(a)",
-            inline=False,
-        )
+        embed.add_field(name="🗺️ Zdjęcia", value=f"{len(images)} zdjęcie(a)", inline=False)
         extra_embeds, files = _build_image_embeds(images, SPACE_NOTICES_ENTRY_LINK.format(slug=slug))
         embeds.extend(extra_embeds)
     else:
-        embed.add_field(
-            name="🗺️ Mapa zagrożenia",
-            value="Brak aktywnego wpisu startu ze zdjęciami na space-notices.com.",
-            inline=False,
-        )
+        embed.add_field(name="🗺️ Zdjęcia", value="Brak zdjęć dla tego wpisu.", inline=False)
 
     embed.set_footer(text="Źródło: space-notices.com")
     return embeds, files
 
+class EntrySelect(discord.ui.Select):
+    def __init__(self, entries: list[tuple[str, str]]):
+        options = [
+            discord.SelectOption(label=name[:100], value=slug)
+            for slug, name in entries[:25]
+        ]
+        super().__init__(placeholder="Wybierz start / wpis...", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        try:
+            embeds, files = await build_entry_embed(self.values[0])
+            await interaction.edit_original_response(embeds=embeds, attachments=files, view=self.view)
+        except Exception:
+            traceback.print_exc()
+            await interaction.followup.send("Nie udało się pobrać danych dla tego wpisu.", ephemeral=True)
+
+class SpaceNoticesView(discord.ui.View):
+    def __init__(self, entries: list[tuple[str, str]]):
+        super().__init__(timeout=300)
+        self.add_item(EntrySelect(entries))
+
 @bot.tree.command(
     name="spacenotices",
-    description="Pokaż notki i zdjęcia TFR wyłącznie ze space-notices.com"
+    description="Wybierz start i zobacz jego notki oraz zdjęcia ze space-notices.com"
 )
 async def space_notices_slash(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        embeds, files = await build_space_notices_embed()
-        await interaction.followup.send(embeds=embeds, files=files or discord.utils.MISSING)
+        entries = await asyncio.to_thread(fetch_active_entries)
     except Exception:
         traceback.print_exc()
-        await interaction.followup.send("Nie udało się pobrać danych ze space-notices.com.")
+        await interaction.followup.send("Nie udało się pobrać listy wpisów ze space-notices.com.")
+        return
+    if not entries:
+        await interaction.followup.send("Brak aktywnych wpisów na space-notices.com.")
+        return
+    embed = discord.Embed(
+        title="Space Notices",
+        description="Wybierz start z listy, żeby zobaczyć jego notki i zdjęcia.",
+        color=discord.Color.blurple(),
+    )
+    await interaction.followup.send(embed=embed, view=SpaceNoticesView(entries))
 @bot.command(name="spacenotices")
 async def space_notices_prefix(ctx: commands.Context):
     async with ctx.typing():
         try:
-            embeds, files = await build_space_notices_embed()
-            await ctx.send(embeds=embeds, files=files or discord.utils.MISSING)
+            entries = await asyncio.to_thread(fetch_active_entries)
         except Exception as e:
             traceback.print_exc()
             await ctx.send(f"wyjebka: `{type(e).__name__}: {e}`")
+            return
+    if not entries:
+        await ctx.send("Brak aktywnych wpisów na space-notices.com.")
+        return
+    embed = discord.Embed(
+        title="Space Notices",
+        description="Wybierz start z listy, żeby zobaczyć jego notki i zdjęcia.",
+        color=discord.Color.blurple(),
+    )
+    await ctx.send(embed=embed, view=SpaceNoticesView(entries))
 
 @bot.tree.command(
     name="tfr",
