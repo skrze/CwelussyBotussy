@@ -99,9 +99,16 @@ async def zamkniecia_prefix(ctx: commands.Context):
         try:
             embed = await build_starbase_embed()
             await ctx.send(embed=embed)
+<<<<<<< HEAD
         except Exception:
             traceback.print_exc()
             await ctx.send("Nie udało się pobrać danych ze strony starbase.texas.gov.")
+=======
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            await ctx.send(f"wyjebka: `{type(e).__name__}: {e}`")
+>>>>>>> 11fe37295a751616fe81709acd6063832dbf09f8
 
 
 @bot.event
