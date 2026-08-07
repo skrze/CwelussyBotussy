@@ -437,6 +437,20 @@ def save_road_closed_state(closed: bool) -> None:
     with open(ROAD_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump({"closed": closed}, f)
 
+def _classify_road_status(road_text: str) -> bool | None:
+    """True = confirmed closed, False = confirmed clear, None = the scrape
+    didn't get a real answer this cycle. Starbase's CMS list for road status
+    occasionally renders with zero items even though the container element
+    exists, which falls back to fetch_starbase_status's placeholder text —
+    that must never be read as "closed", or every empty scrape looks like
+    a brand new closure."""
+    lowered = road_text.lower()
+    if "no road delays" in lowered:
+        return False
+    if not road_text or road_text == "Brak danych o drodze.":
+        return None
+    return True
+
 @tasks.loop(minutes=ROAD_CHECK_INTERVAL_MINUTES)
 async def watch_for_road_closures():
     try:
@@ -445,7 +459,10 @@ async def watch_for_road_closures():
         traceback.print_exc()
         return
 
-    is_closed = "no road delays" not in road_text.lower()
+    is_closed = _classify_road_status(road_text)
+    if is_closed is None:
+        return  # couldn't read the page this cycle; leave state alone and retry next interval
+
     was_closed = load_road_closed_state()
     save_road_closed_state(is_closed)
     # On the very first check ever (was_closed is None) just establish the
