@@ -4,3 +4,4 @@ __pycache__/
 venv/
 .env.example
 tfr_seen.json
+road_state.json

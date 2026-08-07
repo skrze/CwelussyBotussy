@@ -32,20 +32,6 @@ async def test_prefix(ctx: commands.Context):
 async def cwel_command(ctx: commands.Context):
     await ctx.send("sam jestes cwel")
 
-@bot.tree.command(name="help", description="Rozpiska komend bota")
-async def bulid_help_embed(interaction: discord.Interaction):
-    embed = discord.Embed(title="Lista komend:", description="jestem cwelem", color=0x00ff00)
-    embed.add_field(name="Zamkniecia", value="Wyswietla dane na temat zamkniec w box chix ", inline=False)
-    embed.add_field(name="TFR", value="Sprawdza czy pojawily sie nowe TFR nad Starbase", inline=False)
-    embed.add_field(
-        name="Auto-alert",
-        value=f"Bot sam sprawdza co {TFR_CHECK_INTERVAL_MINUTES} min i wysyla nowe TFR na <#{NOTIFY_CHANNEL_ID}>",
-        inline=False,
-    )
-    embed.add_field(name="Spacenotices", value="Lista aktywnych startow do wyboru - notki i zdjecia po wybraniu", inline=False)
-    await interaction.response.send_message(embed=embed)
-
-
 
 STARBASE_URL = "https://www.starbase.texas.gov/beach-road-access"
 
@@ -153,12 +139,15 @@ def fetch_starbase_tfrs() -> list[dict]:
         and any(kw in tfr.get("description", "").lower() for kw in STARBASE_TFR_KEYWORDS)
     ]
 
-def load_seen_tfr_ids() -> set[str]:
+def load_seen_tfr_ids() -> set[str] | None:
+    """None means "no baseline recorded yet" (e.g. first ever run, or a
+    fresh deploy where tfr_seen.json doesn't exist) — distinct from an empty
+    set, which means we've checked before and genuinely saw nothing."""
     try:
         with open(TFR_SEEN_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
     except (FileNotFoundError, json.JSONDecodeError):
-        return set()
+        return None
 
 def save_seen_tfr_ids(ids: set[str]) -> None:
     with open(TFR_SEEN_FILE, "w", encoding="utf-8") as f:
@@ -167,10 +156,13 @@ def save_seen_tfr_ids(ids: set[str]) -> None:
 def _consume_new_tfr_ids(tfrs: list[dict]) -> tuple[set[str], set[str]]:
     """Diffs the current TFR ids against what was last persisted, then
     persists the current set. Called once per check (manual or background)
-    so a new TFR is only ever flagged "new" the first time it's seen."""
+    so a new TFR is only ever flagged "new" the first time it's seen. On the
+    very first check ever (no baseline yet) nothing is flagged "new" — it
+    just establishes the baseline, instead of announcing every currently
+    active TFR as if it just appeared."""
     seen_ids = load_seen_tfr_ids()
     current_ids = {tfr["notam_id"] for tfr in tfrs}
-    new_ids = current_ids - seen_ids
+    new_ids = set() if seen_ids is None else current_ids - seen_ids
     save_seen_tfr_ids(current_ids)
     return current_ids, new_ids
 
@@ -294,6 +286,12 @@ def fetch_starbase_launch_images() -> list[tuple[bytes, str, str, int]]:
         return []
     return _fetch_entry_images(match.group(1))
 
+def _extract_notam_number(name: str) -> str | None:
+    """space-notices.com notice names look like 'FDC 6/2751'; FAA's notam_id
+    for the same NOTAM is just '6/2751'."""
+    match = re.search(r"\d+/\d+", name)
+    return match.group(0) if match else None
+
 def _format_space_notice_lines(notices: list[dict]) -> str:
     lines = []
     for n in notices:
@@ -322,6 +320,16 @@ async def _build_tfr_content(tfrs: list[dict], new_ids: set[str]) -> tuple[list[
             color=discord.Color.green(),
         )], []
 
+    try:
+        space_notices = await asyncio.to_thread(fetch_entry_notices, STARBASE_TESTING_COLLECTION_SLUG)
+    except Exception:
+        traceback.print_exc()
+        space_notices = []
+    confirmed_numbers = {
+        num for n in space_notices
+        if not n.get("cancelled") and (num := _extract_notam_number(n.get("name", "")))
+    }
+
     embed = discord.Embed(
         title="TFR — Starbase / Boca Chica",
         description=(
@@ -332,22 +340,15 @@ async def _build_tfr_content(tfrs: list[dict], new_ids: set[str]) -> tuple[list[
     )
     for tfr in tfrs:
         mark = "🆕 " if tfr["notam_id"] in new_ids else ""
+        confirmation = (
+            "✅ potwierdzone na space-notices.com" if tfr["notam_id"] in confirmed_numbers
+            else "⚠️ brak potwierdzenia na space-notices.com"
+        )
         embed.add_field(
             name=f"{mark}NOTAM {tfr['notam_id']} ({tfr.get('type', '?')})",
             value=f"{tfr.get('description', 'brak opisu')}\n"
+                  f"{confirmation}\n"
                   f"[Szczegóły]({TFR_INFO_URL.format(notam_id=tfr['notam_id'])})",
-            inline=False,
-        )
-
-    try:
-        space_notices = await asyncio.to_thread(fetch_entry_notices, STARBASE_TESTING_COLLECTION_SLUG)
-    except Exception:
-        traceback.print_exc()
-        space_notices = []
-    if space_notices:
-        embed.add_field(
-            name="📡 Potwierdzenie (space-notices.com)",
-            value=_format_space_notice_lines(space_notices),
             inline=False,
         )
 
@@ -378,6 +379,17 @@ async def build_tfr_embed() -> tuple[list[discord.Embed], list[discord.File]]:
 
 NOTIFY_CHANNEL_ID = 1535271197304946688
 TFR_CHECK_INTERVAL_MINUTES = 1
+
+async def _get_notify_channel() -> discord.abc.Messageable | None:
+    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    if channel is not None:
+        return channel
+    try:
+        return await bot.fetch_channel(NOTIFY_CHANNEL_ID)
+    except discord.HTTPException:
+        traceback.print_exc()
+        return None
+
 @tasks.loop(minutes=TFR_CHECK_INTERVAL_MINUTES)
 async def watch_for_new_tfrs():
     try:
@@ -390,13 +402,9 @@ async def watch_for_new_tfrs():
     if not new_ids:
         return
 
-    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
+    channel = await _get_notify_channel()
     if channel is None:
-        try:
-            channel = await bot.fetch_channel(NOTIFY_CHANNEL_ID)
-        except discord.HTTPException:
-            traceback.print_exc()
-            return
+        return
 
     try:
         embeds, files = await _build_tfr_content(tfrs, new_ids)
@@ -410,6 +418,59 @@ async def watch_for_new_tfrs():
 
 @watch_for_new_tfrs.before_loop
 async def before_watch_for_new_tfrs():
+    await bot.wait_until_ready()
+
+ROAD_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "road_state.json")
+ROAD_CHECK_INTERVAL_MINUTES = 1
+
+def load_road_closed_state() -> bool | None:
+    """None means "no baseline recorded yet" (first ever run, or a fresh
+    deploy where road_state.json doesn't exist) — distinct from False,
+    which means we've checked before and it was genuinely open."""
+    try:
+        with open(ROAD_STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("closed")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def save_road_closed_state(closed: bool) -> None:
+    with open(ROAD_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"closed": closed}, f)
+
+@tasks.loop(minutes=ROAD_CHECK_INTERVAL_MINUTES)
+async def watch_for_road_closures():
+    try:
+        _beach_text, road_text = await asyncio.to_thread(fetch_starbase_status)
+    except Exception:
+        traceback.print_exc()
+        return
+
+    is_closed = "no road delays" not in road_text.lower()
+    was_closed = load_road_closed_state()
+    save_road_closed_state(is_closed)
+    # On the very first check ever (was_closed is None) just establish the
+    # baseline — don't announce an already-ongoing closure as if it just happened.
+    if not is_closed or was_closed is None or was_closed:
+        return
+
+    channel = await _get_notify_channel()
+    if channel is None:
+        return
+
+    try:
+        embed = discord.Embed(
+            title="🚧 Zamknięcia HWY4",
+            description=road_text,
+            url=STARBASE_URL,
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text="Źródło: starbase.texas.gov")
+        await channel.send(content="🚧 Pojawiło się zamknięcie drogi w Starbase!", embed=embed)
+    except Exception:
+        traceback.print_exc()
+
+@watch_for_road_closures.before_loop
+async def before_watch_for_road_closures():
     await bot.wait_until_ready()
 
 async def build_entry_embed(slug: str) -> tuple[list[discord.Embed], list[discord.File]]:
@@ -510,7 +571,7 @@ async def space_notices_prefix(ctx: commands.Context):
 
 @bot.tree.command(
     name="tfr",
-    description="Sprawdź, czy pojawiły się nowe TFR-y nad Starbase (Boca Chica)"
+    description="Sprawdź TFR-y nad Starbase: dane z FAA, potwierdzenie i zdjęcia ze space-notices.com"
 )
 async def tfr_slash(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -534,9 +595,12 @@ async def on_ready():
     await bot.tree.sync()
     if not watch_for_new_tfrs.is_running():
         watch_for_new_tfrs.start()
+    if not watch_for_road_closures.is_running():
+        watch_for_road_closures.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     print("Slash commands synced. Try /test or ?test in your server.")
     print(f"Watching for new Starbase TFRs every {TFR_CHECK_INTERVAL_MINUTES} min -> channel {NOTIFY_CHANNEL_ID}")
+    print(f"Watching for Starbase road closures every {ROAD_CHECK_INTERVAL_MINUTES} min -> channel {NOTIFY_CHANNEL_ID}")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
