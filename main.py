@@ -44,12 +44,12 @@ def fetch_starbase_status() -> tuple[str, str]:
     soup = BeautifulSoup(resp.text, "html.parser")
 
     beach_container = soup.find(id="beach-closure")
-    beach_text = "Brak danych o statusie plaży."
-
-    #tymczasowa poprawka dla jacusia
-    if beach_container:
-        beach_text = beach_container.get_text(" ", strip=True)
-
+    beach_text = (
+        beach_container.find("div", class_="cms-big-text").get_text(strip=True)
+        if beach_container
+        else "Brak danych o statusie plaży."
+    
+    )
 
     road_container = soup.find(id="road-closure")
     road_text = "Brak danych o drodze."
@@ -99,10 +99,9 @@ async def zamkniecia_prefix(ctx: commands.Context):
         try:
             embed = await build_starbase_embed()
             await ctx.send(embed=embed)
-        except Exception as e:
-            import traceback
+        except Exception:
             traceback.print_exc()
-            await ctx.send(f"wyjebka: `{type(e).__name__}: {e}`")
+            await ctx.send("Nie udało się pobrać danych ze strony starbase.texas.gov.")
 
 
 @bot.event
