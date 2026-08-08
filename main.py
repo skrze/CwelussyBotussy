@@ -4,6 +4,9 @@ import json
 import os
 import re
 import traceback
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import discord
 import requests
@@ -18,16 +21,16 @@ if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN not found. Put it in your .env file (see .env.example).")
 
 intents = discord.Intents.default()
-intents.message_content = True  # required for ?prefix commands to be read
+intents.message_content = True  # required for .prefix commands to be read
 
-bot = commands.Bot(command_prefix="?", intents=intents)
+bot = commands.Bot(command_prefix=".", intents=intents)
 
 @bot.tree.command(name="test", description="A simple test command")
 async def test_slash(interaction: discord.Interaction):
     await interaction.response.send_message("cwel")
 @bot.command(name="test")
 async def test_prefix(ctx: commands.Context):
-    await ctx.send("chuj ci w dupe cwelu")
+    await ctx.send(f" Masz {round(bot.latency * 1000)} ms pingu, cwelu")
 @bot.command(name="cwel")
 async def cwel_command(ctx: commands.Context):
     await ctx.send("sam jestes cwel")
@@ -35,7 +38,58 @@ async def cwel_command(ctx: commands.Context):
 
 STARBASE_URL = "https://www.starbase.texas.gov/beach-road-access"
 
-def fetch_starbase_status() -> tuple[str, str]:
+# Starbase publishes closure windows in local Texas (Boca Chica) time.
+STARBASE_TZ = ZoneInfo("America/Chicago")
+
+DATE_RANGE_RE = re.compile(r"Date:\s*(.+?)\s+to\s+(.+)$", re.IGNORECASE)
+DATE_PART_RE = re.compile(r"([A-Za-z]+)\s+(\d{1,2})\s+(\d{1,2}:\d{2}\s*[AP]M)", re.IGNORECASE)
+
+def _parse_starbase_datetime(raw: str, year: int) -> datetime | None:
+    match = DATE_PART_RE.search(raw)
+    if not match:
+        return None
+    month, day, time_part = match.groups()
+    try:
+        naive = datetime.strptime(f"{month} {day} {year} {time_part}", "%B %d %Y %I:%M %p")
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=STARBASE_TZ)
+
+def _parse_starbase_date_range(detail_text: str) -> tuple[datetime, datetime] | None:
+    match = DATE_RANGE_RE.search(detail_text)
+    if not match:
+        return None
+    start_raw, end_raw = match.group(1).strip(), match.group(2).strip()
+
+    now_year = datetime.now(STARBASE_TZ).year
+    start_dt = _parse_starbase_datetime(start_raw, now_year)
+    end_dt = _parse_starbase_datetime(end_raw, now_year)
+    if start_dt is None or end_dt is None:
+        return None
+    if end_dt < start_dt:
+        end_dt = end_dt.replace(year=end_dt.year + 1)
+    return start_dt, end_dt
+
+def _hammer(dt: datetime, style: str = "f") -> str:
+    """Discord timestamp markup (a.k.a. "hammertime") — Discord renders this
+    client-side in each reader's own local timezone and language, so Polish
+    readers see Polish local time automatically without us converting."""
+    return f"<t:{int(dt.timestamp())}:{style}>"
+
+def _format_road_status(status: str, detail_text: str) -> str:
+    if not detail_text:
+        return status
+    date_range = _parse_starbase_date_range(detail_text)
+    if date_range:
+        start_dt, end_dt = date_range
+        hammer_range = f"{_hammer(start_dt, 'f')} - {_hammer(end_dt, 't')}"
+        detail_text = DATE_RANGE_RE.sub(f"Date: {hammer_range}", detail_text)
+    return f"{status}\n{detail_text}"
+
+def fetch_starbase_page() -> tuple[str, str | None, str]:
+    """Returns (beach_text, road_status, road_detail_text). road_status/detail
+    are the raw scraped strings (Texas-local dates, not yet hammer-formatted)
+    so callers can either format them for display or parse the date range."""
     resp = requests.get(
         STARBASE_URL,
         headers={"User-Agent": "Mozilla/5.0"},
@@ -51,15 +105,29 @@ def fetch_starbase_status() -> tuple[str, str]:
         beach_text = beach_container.get_text(" ", strip=True)
 
     road_container = soup.find(id="road-closure")
-    road_text = "Brak danych o drodze."
+    road_status, road_detail_text = None, ""
     if road_container:
-        visible = [
-            el.get_text(strip=True)
-            for el in road_container.find_all("div", class_="cms-big-text")
-            if "w-condition-invisible" not in (el.get("class") or [])
-        ]
-        if visible:
-            road_text = " ".join(visible)
+        notice = road_container.find("div", class_="notice-container-no-hover")
+        if notice:
+            road_status = next(
+                (
+                    el.get_text(strip=True)
+                    for el in notice.find_all("div", class_="cms-big-text")
+                    if "w-condition-invisible" not in (el.get("class") or [])
+                ),
+                None,
+            )
+            if road_status:
+                detail_el = notice.find(id="rich-notification")
+                road_detail_text = detail_el.get_text("\n", strip=True) if detail_el else ""
+    return beach_text, road_status, road_detail_text
+
+def fetch_starbase_status() -> tuple[str, str]:
+    beach_text, road_status, road_detail_text = fetch_starbase_page()
+    road_text = (
+        _format_road_status(road_status, road_detail_text)
+        if road_status else "Brak danych o drodze."
+    )
     return beach_text, road_text
 
 async def build_starbase_embed() -> discord.Embed:
@@ -116,6 +184,44 @@ async def zamkniecia_prefix(ctx: commands.Context):
         try:
             embed = await build_starbase_embed()
             await ctx.send(embed=embed)
+        except Exception as e:
+            traceback.print_exc()
+            await ctx.send(f"wyjebka: `{type(e).__name__}: {e}`")
+
+async def build_tcd_message() -> str:
+    """Time-to-closure: how long until the next HWY4 closure starts, or (if
+    one is already underway) how long until it ends."""
+    _beach_text, road_status, road_detail_text = await asyncio.to_thread(fetch_starbase_page)
+    date_range = _parse_starbase_date_range(road_detail_text) if road_status else None
+    if date_range is None:
+        if road_status and "no road delays" in road_status.lower():
+            return "✅ Brak zaplanowanego zamknięcia drogi HWY4."
+        return "Nie udało się odczytać godzin zamknięcia ze strony starbase.texas.gov."
+
+    start_dt, end_dt = date_range
+    now = datetime.now(STARBASE_TZ)
+    if now < start_dt:
+        return f"🚧 Zamknięcie HWY4 zacznie się {_hammer(start_dt, 'R')} ({_hammer(start_dt, 'f')})"
+    if now <= end_dt:
+        return f"🚧 Zamknięcie HWY4 trwa, koniec {_hammer(end_dt, 'R')} ({_hammer(end_dt, 'f')})"
+    return f"✅ Ostatnie znane zamknięcie HWY4 zakończyło się {_hammer(end_dt, 'R')} ({_hammer(end_dt, 'f')})"
+
+@bot.tree.command(
+    name="tcd",
+    description="Czas do najbliższego zamknięcia HWY4 w Starbase (lub do jego końca, jeśli już trwa)"
+)
+async def tcd_slash(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        await interaction.followup.send(await build_tcd_message())
+    except Exception:
+        traceback.print_exc()
+        await interaction.followup.send("Nie udało się pobrać danych ze strony starbase.texas.gov.")
+@bot.command(name="tcd")
+async def tcd_prefix(ctx: commands.Context):
+    async with ctx.typing():
+        try:
+            await ctx.send(await build_tcd_message())
         except Exception as e:
             traceback.print_exc()
             await ctx.send(f"wyjebka: `{type(e).__name__}: {e}`")
@@ -377,18 +483,21 @@ async def build_tfr_embed() -> tuple[list[discord.Embed], list[discord.File]]:
     _, new_ids = _consume_new_tfr_ids(tfrs)
     return await _build_tfr_content(tfrs, new_ids)
 
-NOTIFY_CHANNEL_ID = 1535271197304946688
+NOTIFY_CHANNEL_IDS = (1535271197304946688, 1535293117941555210)
 TFR_CHECK_INTERVAL_MINUTES = 1
 
-async def _get_notify_channel() -> discord.abc.Messageable | None:
-    channel = bot.get_channel(NOTIFY_CHANNEL_ID)
-    if channel is not None:
-        return channel
-    try:
-        return await bot.fetch_channel(NOTIFY_CHANNEL_ID)
-    except discord.HTTPException:
-        traceback.print_exc()
-        return None
+async def _get_notify_channels() -> list[discord.abc.Messageable]:
+    channels = []
+    for channel_id in NOTIFY_CHANNEL_IDS:
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(channel_id)
+            except discord.HTTPException:
+                traceback.print_exc()
+                continue
+        channels.append(channel)
+    return channels
 
 @tasks.loop(minutes=TFR_CHECK_INTERVAL_MINUTES)
 async def watch_for_new_tfrs():
@@ -402,19 +511,27 @@ async def watch_for_new_tfrs():
     if not new_ids:
         return
 
-    channel = await _get_notify_channel()
-    if channel is None:
+    channels = await _get_notify_channels()
+    if not channels:
         return
 
     try:
         embeds, files = await _build_tfr_content(tfrs, new_ids)
-        await channel.send(
-            content=f"🚨 Wykryto {len(new_ids)} nowy(ch) TFR nad Starbase!",
-            embeds=embeds,
-            files=files or discord.utils.MISSING,
-        )
     except Exception:
         traceback.print_exc()
+        return
+
+    for channel in channels:
+        for f in files:
+            f.reset()
+        try:
+            await channel.send(
+                content=f"🚨 Wykryto {len(new_ids)} nowy(ch) TFR nad Starbase!",
+                embeds=embeds,
+                files=files or discord.utils.MISSING,
+            )
+        except Exception:
+            traceback.print_exc()
 
 @watch_for_new_tfrs.before_loop
 async def before_watch_for_new_tfrs():
@@ -470,24 +587,118 @@ async def watch_for_road_closures():
     if not is_closed or was_closed is None or was_closed:
         return
 
-    channel = await _get_notify_channel()
-    if channel is None:
+    channels = await _get_notify_channels()
+    if not channels:
         return
 
-    try:
-        embed = discord.Embed(
-            title="🚧 Zamknięcia HWY4",
-            description=road_text,
-            url=STARBASE_URL,
-            color=discord.Color.orange(),
-        )
-        embed.set_footer(text="Źródło: starbase.texas.gov")
-        await channel.send(content="🚧 Pojawiło się zamknięcie drogi w Starbase!", embed=embed)
-    except Exception:
-        traceback.print_exc()
+    embed = discord.Embed(
+        title="🚧 Zamknięcia HWY4",
+        description=road_text,
+        url=STARBASE_URL,
+        color=discord.Color.orange(),
+    )
+    embed.set_footer(text="Źródło: starbase.texas.gov")
+    for channel in channels:
+        try:
+            await channel.send(content="🚧 Pojawiło się zamknięcie drogi w Starbase!", embed=embed)
+        except Exception:
+            traceback.print_exc()
 
 @watch_for_road_closures.before_loop
 async def before_watch_for_road_closures():
+    await bot.wait_until_ready()
+
+SPACEX_TWITTER_HANDLE = "SpaceX"
+# Public Nitter-compatible mirrors — these come and go, so we try a short
+# list in order and use whichever one responds with a working RSS feed.
+SPACEX_NITTER_INSTANCES = [
+    "https://xcancel.com",
+    "https://nitter.poast.org",
+    "https://nitter.privacyredirect.com",
+    "https://nitter.net",
+]
+SPACEX_TWEET_LINK_RE = re.compile(r"/status/(\d+)")
+SPACEX_SEEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spacex_tweets_seen.json")
+SPACEX_CHECK_INTERVAL_MINUTES = 2
+
+def fetch_spacex_tweets() -> list[dict]:
+    """Returns SpaceX's recent tweets as {id, url, text, published}, newest
+    first. Tries each Nitter mirror in turn until one returns a usable feed."""
+    for base in SPACEX_NITTER_INSTANCES:
+        try:
+            resp = requests.get(
+                f"{base}/{SPACEX_TWITTER_HANDLE}/rss",
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+        except Exception:
+            traceback.print_exc()
+            continue
+
+        tweets = []
+        for item in root.findall("./channel/item"):
+            link = (item.findtext("link") or "").strip()
+            match = SPACEX_TWEET_LINK_RE.search(link)
+            if not match:
+                continue
+            tweets.append({
+                "id": match.group(1),
+                "url": f"https://twitter.com/{SPACEX_TWITTER_HANDLE}/status/{match.group(1)}",
+                "text": (item.findtext("title") or "").strip(),
+                "published": (item.findtext("pubDate") or "").strip(),
+            })
+        if tweets:
+            return tweets
+    return []
+
+def load_seen_tweet_ids() -> set[str] | None:
+    """None means "no baseline recorded yet" — distinct from an empty set,
+    which means we've checked before and genuinely saw nothing new."""
+    try:
+        with open(SPACEX_SEEN_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+def save_seen_tweet_ids(ids: set[str]) -> None:
+    with open(SPACEX_SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(ids), f)
+
+@tasks.loop(minutes=SPACEX_CHECK_INTERVAL_MINUTES)
+async def watch_for_spacex_tweets():
+    try:
+        tweets = await asyncio.to_thread(fetch_spacex_tweets)
+    except Exception:
+        traceback.print_exc()
+        return
+    if not tweets:
+        return  # all Nitter mirrors failed this cycle; leave state alone and retry later
+
+    seen_ids = load_seen_tweet_ids()
+    current_ids = {t["id"] for t in tweets}
+    # On the very first check ever (seen_ids is None) just establish the
+    # baseline — don't announce every tweet currently in the feed as "new".
+    new_ids = set() if seen_ids is None else current_ids - seen_ids
+    save_seen_tweet_ids(current_ids)
+    if not new_ids:
+        return
+
+    channels = await _get_notify_channels()
+    if not channels:
+        return
+
+    new_tweets = sorted((t for t in tweets if t["id"] in new_ids), key=lambda t: int(t["id"]))
+    for tweet in new_tweets:
+        for channel in channels:
+            try:
+                await channel.send(f"🚀 Nowy tweet SpaceX!\n{tweet['url']}")
+            except Exception:
+                traceback.print_exc()
+
+@watch_for_spacex_tweets.before_loop
+async def before_watch_for_spacex_tweets():
     await bot.wait_until_ready()
 
 async def build_entry_embed(slug: str) -> tuple[list[discord.Embed], list[discord.File]]:
@@ -614,10 +825,13 @@ async def on_ready():
         watch_for_new_tfrs.start()
     if not watch_for_road_closures.is_running():
         watch_for_road_closures.start()
+    if not watch_for_spacex_tweets.is_running():
+        watch_for_spacex_tweets.start()
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
-    print("Slash commands synced. Try /test or ?test in your server.")
-    print(f"Watching for new Starbase TFRs every {TFR_CHECK_INTERVAL_MINUTES} min -> channel {NOTIFY_CHANNEL_ID}")
-    print(f"Watching for Starbase road closures every {ROAD_CHECK_INTERVAL_MINUTES} min -> channel {NOTIFY_CHANNEL_ID}")
+    print("Slash commands synced. Try /test or .test in your server.")
+    print(f"Watching for new Starbase TFRs every {TFR_CHECK_INTERVAL_MINUTES} min -> channels {NOTIFY_CHANNEL_IDS}")
+    print(f"Watching for Starbase road closures every {ROAD_CHECK_INTERVAL_MINUTES} min -> channels {NOTIFY_CHANNEL_IDS}")
+    print(f"Watching for new SpaceX tweets every {SPACEX_CHECK_INTERVAL_MINUTES} min -> channels {NOTIFY_CHANNEL_IDS}")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
