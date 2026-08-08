@@ -5,3 +5,4 @@ venv/
 .env.example
 tfr_seen.json
 road_state.json
+spacex_tweets_seen.json

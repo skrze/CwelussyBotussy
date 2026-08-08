@@ -609,13 +609,16 @@ async def before_watch_for_road_closures():
     await bot.wait_until_ready()
 
 SPACEX_TWITTER_HANDLE = "SpaceX"
-# Public Nitter-compatible mirrors — these come and go, so we try a short
-# list in order and use whichever one responds with a working RSS feed.
+# Public Nitter-compatible mirrors — these come and go (many now sit behind
+# an "Anubis" bot-check that returns 200/403 with an HTML challenge page
+# instead of RSS), so we try a short list in order and use whichever one
+# responds with real XML. nitter.net first since it's currently the most
+# reliable of the bunch; the rest are kept as fallbacks in case it goes down.
 SPACEX_NITTER_INSTANCES = [
+    "https://nitter.net",
     "https://xcancel.com",
     "https://nitter.poast.org",
     "https://nitter.privacyredirect.com",
-    "https://nitter.net",
 ]
 SPACEX_TWEET_LINK_RE = re.compile(r"/status/(\d+)")
 SPACEX_SEEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spacex_tweets_seen.json")
@@ -633,8 +636,11 @@ def fetch_spacex_tweets() -> list[dict]:
             )
             resp.raise_for_status()
             root = ET.fromstring(resp.content)
-        except Exception:
-            traceback.print_exc()
+        except Exception as e:
+            # A mirror being down/blocked is routine, not a bug — log one
+            # short line instead of a full traceback so this doesn't spam
+            # the console every SPACEX_CHECK_INTERVAL_MINUTES.
+            print(f"[spacex] {base} niedostępne ({type(e).__name__}: {e}), próbuję kolejny mirror...")
             continue
 
         tweets = []
