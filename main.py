@@ -148,7 +148,7 @@ async def build_starbase_embed() -> discord.Embed:
         else discord.Color.orange()
     )
     embed = discord.Embed(
-        title="Starbase — status plaży i drogi (Hwy 4)",
+        title="Status drogi HWY4:",
         url=STARBASE_URL,
         color=color,
     )
@@ -162,7 +162,7 @@ async def build_starbase_embed() -> discord.Embed:
         value=road_text,
         inline=False
     )
-    embed.set_footer(text="Źródło: starbase.texas.gov")
+    embed.set_footer(text="starbase.texas.gov")
     return embed
 
 @bot.tree.command(
@@ -196,7 +196,7 @@ async def build_tcd_message() -> str:
     if date_range is None:
         if road_status and "no road delays" in road_status.lower():
             return "✅ Brak zaplanowanego zamknięcia drogi HWY4."
-        return "Nie udało się odczytać godzin zamknięcia ze strony starbase.texas.gov."
+        return "Brak zamknięć."
 
     start_dt, end_dt = date_range
     now = datetime.now(STARBASE_TZ)
@@ -216,7 +216,7 @@ async def tcd_slash(interaction: discord.Interaction):
         await interaction.followup.send(await build_tcd_message())
     except Exception:
         traceback.print_exc()
-        await interaction.followup.send("Nie udało się pobrać danych ze strony starbase.texas.gov.")
+        await interaction.followup.send("Brak zamknięć.")
 @bot.command(name="tcd")
 async def tcd_prefix(ctx: commands.Context):
     async with ctx.typing():
